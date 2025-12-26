@@ -64,7 +64,7 @@ def generate_single_sample(args):
         ]
 
     # todo 如果需要固定位置 (如之前建议的)，在这里覆盖 receiverPos
-    receiverPos = np.array([[0,0,0], [3500,0,0], [3500,3500,0], [0,3500,0]])
+    receiverPos = np.array([[0, 0, 0], [5000, 0, 0], [5000, 5000, 0], [0, 5000, 0]])
     receiverVel = np.zeros_like(receiverPos)
 
     # 发射机位置/速度
