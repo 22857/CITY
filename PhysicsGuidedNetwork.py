@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # === 1. 通道注意力模块 (Channel Attention) ===

@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-
+from ProcessedSampleDataset import ProcessedSampleDataset
 # ================= 配置区域 =================
 # 1. 路径设置 (请修改为你实际的路径)
 DATASET_ROOT = r"D:\Dataset\SignalDataset\SNR[5, 5]\train"  # 建议先生成 train 集
@@ -20,21 +20,6 @@ C = 299792458.0  # 光速
 # 3. GPU 设置
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 BATCH_SIZE = 100  # 每次处理多少条数据 (显存不够改小)
-
-# ================= 导入 Dataset =================
-# 动态添加路径以防报错
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(os.path.join(current_dir, 'DataLoader'))
-try:
-    from ProcessedSampleDataset import ProcessedSampleDataset
-except ImportError:
-    # 假设 ProcessedSampleDataset.py 在同级目录
-    try:
-        from ProcessedSampleDataset import ProcessedSampleDataset
-    except ImportError:
-        print("【错误】找不到 ProcessedSampleDataset，请检查路径配置。")
-        sys.exit(1)
-
 
 # ================= 核心函数 1: 生成粗糙 DPD 热力图 (GPU) =================
 def generate_dpd_map_batch(iq_batch, rx_pos_batch, map_size, scene_size, fs, device):

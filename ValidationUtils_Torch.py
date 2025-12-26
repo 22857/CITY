@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 
 
 def dpd_search_torch(rcvPos, sig_rcv_time, init_pos, edge, lamda, fs, device='cuda'):
