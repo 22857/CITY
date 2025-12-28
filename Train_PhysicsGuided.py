@@ -34,7 +34,7 @@ def main():
     train_set, val_set = random_split(full_dataset, [train_size, val_size])
 
     # Windows 下 num_workers 设置过大可能会导致卡顿，建议 0 或 4
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
     print(f"训练样本: {len(train_set)}, 验证样本: {len(val_set)}")
