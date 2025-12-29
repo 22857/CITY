@@ -5,57 +5,50 @@ from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 import h5py
 import numpy as np
-import sys
 import os
+from PhysicsGuidedNetwork import PhysicsGuidedNet
 
-# 引入你的网络定义
-sys.path.append('DataLoader')
-# 假设 PhysicsGuidedNetwork.py 和 Train 脚本在同一级或能被 python path 找到
-try:
-    from PhysicsGuidedNetwork import PhysicsGuidedNet
-except ImportError:
-    # 尝试直接从当前目录导入
-    from PhysicsGuidedNetwork import PhysicsGuidedNet
-
-# ================= 配置区域 =================
+# ================= 路径配置 =================
+# 请确保该路径指向你生成的 512x512 HDF5 文件
 H5_PATH = r"D:\Dataset\SignalDataset\merged_dataset_512_3d_fast.h5"
-BATCH_SIZE = 32
-CHUNK_SIZE = 4000  # 【关键】每次读入内存的样本数。2000个样本约占 4GB 内存。根据你的内存大小调整。
-LR = 1e-4
-EPOCHS = 50
-SCENE_SIZE = 5000.0
+
+# ================= 超参数配置 =================
+BATCH_SIZE = 32  # GPU 计算时的批次大小
+CHUNK_SIZE = 2000  # 每次从硬盘读入内存的样本数
+LR = 1e-4  # 初始学习率
+EPOCHS = 50  # 总训练轮数
+SCENE_SIZE = 5000.0  # 场景物理尺寸 (米)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+# ================= 验证函数 =================
 def validate(model, val_indices, h5_file, criterion_coord, criterion_mask, chunk_size=1000, batch_size=32):
     """
-    修复后的验证函数：加载大块数据后，使用 DataLoader 分小批次验证，防止爆显存
+    分块加载验证数据，并使用小 Batch 推理，防止 OOM。
     """
     model.eval()
     total_loss = 0.0
     total_dist_err = 0.0
     num_samples = 0
 
-    # 验证集分块加载 (HDD -> RAM)
     with torch.no_grad():
+        # 外层循环：分块从硬盘读入内存
         for i in range(0, len(val_indices), chunk_size):
-            # 1. 获取当前块的索引
+            # 1. 读取当前块数据
             current_indices = val_indices[i: i + chunk_size]
-            current_indices = np.sort(current_indices)  # HDF5 要求升序
+            current_indices = np.sort(current_indices)  # HDF5 要求升序索引
 
-            # 2. 加载到 CPU 内存 (RAM)
-            # 注意：不要在这里直接 .to(DEVICE)，否则 1000 条数据会占满显存
+            # 读入 CPU 内存 (RAM)
             iq_ram = torch.from_numpy(h5_file['iq'][current_indices]).float()
             heatmap_ram = torch.from_numpy(h5_file['heatmap'][current_indices]).float()
             mask_ram = torch.from_numpy(h5_file['mask'][current_indices]).float()
             coord_ram = torch.from_numpy(h5_file['coord'][current_indices]).float()
 
-            # 3. 创建临时 DataLoader (RAM -> GPU Mini-batch)
-            # 这样每次只喂 32 条给 GPU
+            # 2. 构造临时 DataLoader (RAM -> GPU)
             temp_dataset = TensorDataset(iq_ram, heatmap_ram, coord_ram, mask_ram)
             temp_loader = DataLoader(temp_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-            # 4. 小批次推理
+            # 3. 内层循环：小批次推理
             for iq, heatmap, true_coord, mask in temp_loader:
                 iq, heatmap = iq.to(DEVICE), heatmap.to(DEVICE)
                 mask, true_coord = mask.to(DEVICE), true_coord.to(DEVICE)
@@ -63,41 +56,42 @@ def validate(model, val_indices, h5_file, criterion_coord, criterion_mask, chunk
                 # 预测
                 pred_coord, pred_mask = model(iq, heatmap)
 
-                # Loss
+                # Loss 计算 (注意 3D -> 2D 切片)
                 true_coord_xy = true_coord[:, :2]
                 loss_c = criterion_coord(pred_coord, true_coord_xy)
                 loss_m = criterion_mask(pred_mask, mask)
 
-                # 累加误差 (乘以当前 batch 大小)
+                # 累加 Loss
                 batch_len = iq.size(0)
                 total_loss += (loss_c + 0.5 * loss_m).item() * batch_len
 
+                # 累加距离误差 (米)
                 dist_meter = torch.norm(pred_coord - true_coord_xy, dim=1) * SCENE_SIZE
                 total_dist_err += dist_meter.sum().item()
 
                 num_samples += batch_len
 
-            # 释放 RAM
+            # 手动释放内存
             del iq_ram, heatmap_ram, mask_ram, coord_ram, temp_dataset, temp_loader
 
     return total_loss / num_samples, total_dist_err / num_samples
 
 
+# ================= 主程序 =================
 def main():
-    print(f"🚀 启动分块训练 | Chunk Size: {CHUNK_SIZE}")
+    print(f"🚀 启动增强版训练 | Chunk: {CHUNK_SIZE} | Batch: {BATCH_SIZE} | Device: {DEVICE}")
 
     if not os.path.exists(H5_PATH):
-        print("找不到数据集文件！")
+        print(f"【错误】找不到数据集文件: {H5_PATH}")
         return
 
-    # 1. 打开 HDF5 (只读取元数据，不读内容)
+    # 1. 打开 HDF5 (只读取元数据)
     f = h5py.File(H5_PATH, 'r')
     total_samples = len(f['iq'])
-    print(f"总样本数: {total_samples}")
+    print(f"数据集总样本数: {total_samples}")
 
-    # 2. 划分训练/验证集 (索引划分)
+    # 2. 划分训练集/验证集 (90% / 10%)
     all_indices = np.arange(total_samples)
-    # 不打乱总索引，直接按前90%后10%切分，保证训练集在硬盘上是连续的，读取最快
     split_idx = int(0.9 * total_samples)
     train_indices_all = all_indices[:split_idx]
     val_indices_all = all_indices[split_idx:]
@@ -107,8 +101,16 @@ def main():
     # 3. 初始化模型
     sample_iq = f['iq'][0]
     num_rx = sample_iq.shape[0] // 2
+
     model = PhysicsGuidedNet(num_rx=num_rx, signal_len=2048).to(DEVICE)
+
+    # 优化器
     optimizer = optim.Adam(model.parameters(), lr=LR)
+
+    # 【修复】移除了 verbose=True，防止报错
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
+    )
 
     criterion_coord = nn.MSELoss()
     criterion_mask = nn.MSELoss()
@@ -116,90 +118,96 @@ def main():
     best_err = float('inf')
 
     # ================= 训练循环 =================
-    for epoch in range(EPOCHS):
-        model.train()
-        train_loss_epoch = 0.0
-        processed_samples = 0
+    try:
+        for epoch in range(EPOCHS):
+            model.train()
+            train_loss_epoch = 0.0
 
-        # 进度条
-        pbar = tqdm(total=len(train_indices_all), desc=f"Epoch {epoch + 1}/{EPOCHS}")
+            # 进度条
+            pbar = tqdm(total=len(train_indices_all), desc=f"Epoch {epoch + 1}/{EPOCHS}")
 
-        # --- 分块加载循环 (Chunk Loading) ---
-        # 每次只处理 train_indices_all 中的一部分
-        # 为了保证 I/O 最快，我们按顺序切片读取
+            # --- Chunk Loading: 分块读入内存 ---
+            for chunk_start in range(0, len(train_indices_all), CHUNK_SIZE):
+                chunk_end = min(chunk_start + CHUNK_SIZE, len(train_indices_all))
 
-        for chunk_start in range(0, len(train_indices_all), CHUNK_SIZE):
-            chunk_end = min(chunk_start + CHUNK_SIZE, len(train_indices_all))
+                # A. 硬盘 -> 内存 (RAM)
+                iq_ram = torch.from_numpy(f['iq'][chunk_start:chunk_end])
+                map_ram = torch.from_numpy(f['heatmap'][chunk_start:chunk_end])
+                mask_ram = torch.from_numpy(f['mask'][chunk_start:chunk_end])
+                coord_ram = torch.from_numpy(f['coord'][chunk_start:chunk_end])
 
-            # A. 【加载阶段】从硬盘读入内存
-            # 使用切片 f['key'][start:end] 是最快的顺序读取方式
-            # 注意：这里的索引是相对于 HDF5 文件的绝对索引
-            # 因为我们在上面是按顺序划分的，所以可以直接切片
+                # B. 内存 -> DataLoader
+                mem_dataset = TensorDataset(iq_ram, map_ram, coord_ram, mask_ram)
+                train_loader = DataLoader(mem_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
 
-            # print(f"  Loading chunk {chunk_start}-{chunk_end} to RAM...")
-            iq_ram = torch.from_numpy(f['iq'][chunk_start:chunk_end])
-            map_ram = torch.from_numpy(f['heatmap'][chunk_start:chunk_end])
-            mask_ram = torch.from_numpy(f['mask'][chunk_start:chunk_end])
-            coord_ram = torch.from_numpy(f['coord'][chunk_start:chunk_end])
+                # C. GPU 训练
+                for iq, heatmap, true_coord, mask in train_loader:
+                    iq, heatmap = iq.to(DEVICE), heatmap.to(DEVICE)
+                    mask, true_coord = mask.to(DEVICE), true_coord.to(DEVICE)
 
-            # B. 【构造内存 DataLoader】
-            # 数据已经在内存里了，TensorDataset 包装一下
-            # num_workers=0, 因为内存读取不需要多进程，多进程反而慢
-            mem_dataset = TensorDataset(iq_ram, map_ram, coord_ram, mask_ram)
-            train_loader = DataLoader(mem_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+                    optimizer.zero_grad()
 
-            # C. 【GPU 训练阶段】
-            for iq, heatmap, true_coord, mask in train_loader:
-                iq, heatmap, mask, true_coord = iq.to(DEVICE), heatmap.to(DEVICE), mask.to(DEVICE), true_coord.to(
-                    DEVICE)
+                    # 前向传播
+                    pred_coord, pred_mask = model(iq, heatmap)
 
-                optimizer.zero_grad()
-                pred_coord, pred_mask = model(iq, heatmap)
+                    # 3D 标签切片为 2D
+                    true_coord_xy = true_coord[:, :2]
 
-                true_coord_xy = true_coord[:, :2]
-                loss_c = criterion_coord(pred_coord, true_coord_xy)
-                loss_m = criterion_mask(pred_mask, mask)
-                loss = loss_c + 0.5 * loss_m
+                    loss_c = criterion_coord(pred_coord, true_coord_xy)
+                    loss_m = criterion_mask(pred_mask, mask)
 
-                loss.backward()
-                optimizer.step()
+                    loss = loss_c + 0.5 * loss_m
 
-                train_loss_epoch += loss.item() * iq.size(0)
-                processed_samples += iq.size(0)
+                    loss.backward()
+                    optimizer.step()
 
-            # 更新总进度条
-            pbar.update(chunk_end - chunk_start)
-            pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
+                    train_loss_epoch += loss.item() * iq.size(0)
 
-            # D. 【释放内存】
-            # 进入下一次循环前，iq_ram 等变量会被覆盖或销毁，Python GC 会自动回收
-            del iq_ram, map_ram, mask_ram, coord_ram, mem_dataset, train_loader
+                # 更新进度条
+                current_lr = optimizer.param_groups[0]['lr']
+                pbar.update(chunk_end - chunk_start)
+                pbar.set_postfix({'Loss': f"{loss.item():.4f}", 'LR': f"{current_lr:.1e}"})
 
-        pbar.close()
+                # 释放内存
+                del iq_ram, map_ram, mask_ram, coord_ram, mem_dataset, train_loader
 
-        # --- 验证阶段 ---
-        print("Validating...")
-        # 修改调用方式，传入 batch_size
-        avg_val_loss, avg_dist_err = validate(
-            model,
-            val_indices_all,
-            f,
-            criterion_coord,
-            criterion_mask,
-            chunk_size=CHUNK_SIZE,  # 使用和训练一样的 Chunk 大小读取硬盘
-            batch_size=BATCH_SIZE  # 使用和训练一样的 Batch 大小进行推理
-        )
+            pbar.close()
 
-        avg_train_loss = train_loss_epoch / len(train_indices_all)
-        print(
-            f"Epoch {epoch + 1} Result: Train Loss={avg_train_loss:.5f}, Val Loss={avg_val_loss:.5f}, Err={avg_dist_err:.2f}m")
+            # --- 验证阶段 ---
+            print("正在验证...")
+            avg_val_loss, avg_dist_err = validate(
+                model,
+                val_indices_all,
+                f,
+                criterion_coord,
+                criterion_mask,
+                chunk_size=CHUNK_SIZE,
+                batch_size=BATCH_SIZE
+            )
 
-        if avg_dist_err < best_err:
-            best_err = avg_dist_err
-            torch.save(model.state_dict(), "best_model_chunked.pth")
-            print(">>> Model Saved!")
+            avg_train_loss = train_loss_epoch / len(train_indices_all)
+            print(
+                f"Epoch {epoch + 1} 结果: Train Loss={avg_train_loss:.5f}, Val Loss={avg_val_loss:.5f}, 平均误差={avg_dist_err:.2f}m")
 
-    f.close()
+            # --- 学习率调整 (手动实现 Verbose) ---
+            last_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(avg_val_loss)
+            new_lr = optimizer.param_groups[0]['lr']
+
+            if new_lr != last_lr:
+                print(f"📉 学习率自动衰减: {last_lr:.1e} -> {new_lr:.1e}")
+
+            # --- 保存模型 ---
+            if avg_dist_err < best_err:
+                best_err = avg_dist_err
+                torch.save(model.state_dict(), "best_model_final.pth")
+                print(f">>> 发现新最优模型！误差: {best_err:.2f}m，已保存。")
+
+    except KeyboardInterrupt:
+        print("\n训练被手动中断。")
+    finally:
+        f.close()
+        print("HDF5 文件句柄已关闭。")
 
 
 if __name__ == '__main__':
