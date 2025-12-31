@@ -156,7 +156,8 @@ def main():
                     loss_c = criterion_coord(pred_coord, true_coord_xy)
                     loss_m = criterion_mask(pred_mask, mask)
 
-                    loss = loss_c + 0.5 * loss_m
+                    mask_weight = 0.5 if epoch < 30 else 0.05
+                    loss = loss_c + mask_weight * loss_m
 
                     loss.backward()
                     optimizer.step()
@@ -191,7 +192,7 @@ def main():
 
             # --- 学习率调整 (手动实现 Verbose) ---
             last_lr = optimizer.param_groups[0]['lr']
-            scheduler.step(avg_val_loss)
+            scheduler.step(avg_dist_err)
             new_lr = optimizer.param_groups[0]['lr']
 
             if new_lr != last_lr:

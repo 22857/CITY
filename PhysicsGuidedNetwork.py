@@ -89,7 +89,7 @@ class PhysicsGuidedNet(nn.Module):
             nn.Linear(512 * 8 * 8, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(True),
-            nn.Dropout(0.6)  # 【策略】强 Dropout
+            nn.Dropout(0.1)
         )
 
         # IQ (256) + Map (512) = 768
@@ -97,7 +97,7 @@ class PhysicsGuidedNet(nn.Module):
             nn.Linear(768, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(True),
-            nn.Dropout(0.6),  # 【策略】强 Dropout
+            nn.Dropout(0.1),
             nn.Linear(256, 2),
             nn.Sigmoid()
         )
