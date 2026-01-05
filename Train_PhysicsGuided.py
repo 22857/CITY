@@ -22,7 +22,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 # ================= 验证函数 =================
-def validate(model, val_indices, h5_file, criterion_coord, criterion_mask, chunk_size=1000, batch_size=32):
+def validate(model, val_indices, h5_file, criterion_coord, criterion_bce, criterion_dice, chunk_size=1000, batch_size=32):
     """
     分块加载验证数据，并使用小 Batch 推理，防止 OOM。
     """
@@ -59,11 +59,16 @@ def validate(model, val_indices, h5_file, criterion_coord, criterion_mask, chunk
                 # Loss 计算 (注意 3D -> 2D 切片)
                 true_coord_xy = true_coord[:, :2]
                 loss_c = criterion_coord(pred_coord, true_coord_xy)
-                loss_m = criterion_mask(pred_mask, mask)
+                # 使用传入的混合 Loss 计算验证集损失
+                loss_b = criterion_bce(pred_mask, mask)
+                loss_d = criterion_dice(pred_mask, mask)
+
+                # 验证集权重固定即可，主要参考 dist_err
+                loss_total = loss_c + 0.5 * (loss_b + loss_d)
 
                 # 累加 Loss
                 batch_len = iq.size(0)
-                total_loss += (loss_c + 0.5 * loss_m).item() * batch_len
+                total_loss += loss_total.item() * batch_len  # 使用计算出的 loss_total
 
                 # 累加距离误差 (米)
                 dist_meter = torch.norm(pred_coord - true_coord_xy, dim=1) * SCENE_SIZE
@@ -105,7 +110,7 @@ def main():
     model = PhysicsGuidedNet(num_rx=num_rx, signal_len=2048).to(DEVICE)
 
     # 优化器
-    optimizer = optim.Adam(model.parameters(), lr=LR)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-4)
 
     # 【修复】移除了 verbose=True，防止报错
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -113,7 +118,34 @@ def main():
     )
 
     criterion_coord = nn.MSELoss()
-    criterion_mask = nn.MSELoss()
+
+    # 1. 定义 Dice Loss 类 (解决形状模糊)
+    class DiceLoss(nn.Module):
+        def __init__(self, smooth=1.0):
+            super(DiceLoss, self).__init__()
+            self.smooth = smooth
+
+        def forward(self, pred_logits, target):
+            # 将 Logits 转为概率 (0-1)
+            pred_probs = torch.sigmoid(pred_logits)
+
+            # 展平所有维度，只计算重叠度
+            pred_flat = pred_probs.view(-1)
+            target_flat = target.view(-1)
+
+            intersection = (pred_flat * target_flat).sum()
+
+            # Dice 系数 = 2 * 交集 / (并集 + 平滑项)
+            dice = (2. * intersection + self.smooth) / (pred_flat.sum() + target_flat.sum() + self.smooth)
+
+            return 1 - dice
+
+    # 2. 定义加权 BCE (解决正负样本不平衡)
+    # 假设线条像素很少，给予 20 倍权重，强迫网络关注白色线条
+    pos_weight = torch.tensor([20.0]).to(DEVICE)
+
+    criterion_bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion_dice = DiceLoss()
 
     best_err = float('inf')
 
@@ -154,9 +186,19 @@ def main():
                     true_coord_xy = true_coord[:, :2]
 
                     loss_c = criterion_coord(pred_coord, true_coord_xy)
-                    loss_m = criterion_mask(pred_mask, mask)
+                    # 1. 像素级分类 Loss (带权重)
+                    loss_bce = criterion_bce(pred_mask, mask)
 
-                    mask_weight = 0.5 if epoch < 30 else 0.05
+                    # 2. 形状级 Dice Loss
+                    loss_dice = criterion_dice(pred_mask, mask)
+
+                    # 3. 组合 Mask Loss
+                    loss_m = loss_bce + loss_dice
+
+                    # 动态权重调整：前期侧重学形状(Mask)，后期侧重修坐标(Coord)
+                    # 如果 epoch 小于 20，Mask 的权重给大一点 (0.5)，让 Mask 先成型
+                    mask_weight = 0.5 if epoch < 20 else 0.1
+
                     loss = loss_c + mask_weight * loss_m
 
                     loss.backward()
@@ -181,7 +223,8 @@ def main():
                 val_indices_all,
                 f,
                 criterion_coord,
-                criterion_mask,
+                criterion_bce,
+                criterion_dice,
                 chunk_size=CHUNK_SIZE,
                 batch_size=BATCH_SIZE
             )

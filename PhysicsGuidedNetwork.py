@@ -89,7 +89,7 @@ class PhysicsGuidedNet(nn.Module):
             nn.Linear(512 * 8 * 8, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(True),
-            nn.Dropout(0.1)
+            nn.Dropout(0.2)
         )
 
         # IQ (256) + Map (512) = 768
@@ -97,7 +97,7 @@ class PhysicsGuidedNet(nn.Module):
             nn.Linear(768, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(True),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(256, 2),
             nn.Sigmoid()
         )
@@ -112,7 +112,8 @@ class PhysicsGuidedNet(nn.Module):
             nn.ConvTranspose2d(16, 8, 4, 2, 1),
             nn.BatchNorm2d(8), nn.ReLU(True),
             nn.Conv2d(8, 1, 3, 1, 1),
-            nn.Sigmoid()
+            # 输出 Logits
+            # nn.Sigmoid()
         )
 
     def _conv_block(self, in_c, out_c):

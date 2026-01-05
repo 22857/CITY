@@ -55,7 +55,7 @@ def visualize():
     iq = iq.cpu().numpy()
     heatmap = heatmap.cpu().numpy()
     mask = mask.cpu().numpy()
-    pred_mask = pred_mask.cpu().numpy()
+    pred_mask = torch.sigmoid(pred_mask).cpu().numpy()
 
     # 坐标反归一化 (0-1 -> 0-5000)
     true_coord = true_coord.cpu().numpy()[:, :2] * SCENE_SIZE
