@@ -21,6 +21,37 @@ SCENE_SIZE = 5000.0  # 场景物理尺寸 (米)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+def apply_augmentation(iq, heatmap, coord, mask):
+    """
+    对 Batch 数据进行随机旋转和翻转 (GPU加速)
+    heatmap/mask: [B, 1, 512, 512]
+    coord: [B, 3] (x, y, z) 归一化坐标
+    """
+    B = iq.shape[0]
+
+    # 1. 随机水平翻转 (H-Flip)
+    if np.random.rand() > 0.5:
+        # 图片翻转
+        heatmap = torch.flip(heatmap, [3])  # [B, C, H, W] -> W dim is 3
+        mask = torch.flip(mask, [3])
+        # 坐标翻转 (x 坐标变 1-x)
+        coord[:, 0] = 1.0 - coord[:, 0]
+
+    # 2. 随机垂直翻转 (V-Flip)
+    if np.random.rand() > 0.5:
+        heatmap = torch.flip(heatmap, [2])  # H dim is 2
+        mask = torch.flip(mask, [2])
+        # 坐标翻转 (y 坐标变 1-y)
+        coord[:, 1] = 1.0 - coord[:, 1]
+
+    # 3. 随机 90度 旋转 (Rot90)
+    # 注意：IQ 数据通常对旋转敏感（相位关系），但在纯几何 Mask 任务中，
+    # 如果只依赖 Heatmap 进行定位，旋转是安全的。
+    # 但由于我们的 IQ Encoder 是一维的且包含接收机顺序，简单的旋转可能破坏 IQ 与 空间位置 的对应关系。
+    # ❌ 因此：暂时只做翻转 (Flip)，不做旋转 (Rotate)，除非能同步调整 IQ 中接收机的顺序。
+
+    return iq, heatmap, coord, mask
+
 # ================= 验证函数 =================
 def validate(model, val_indices, h5_file, criterion_coord, criterion_bce, criterion_dice, chunk_size=1000, batch_size=32):
     """
@@ -176,7 +207,9 @@ def main():
                 for iq, heatmap, true_coord, mask in train_loader:
                     iq, heatmap = iq.to(DEVICE), heatmap.to(DEVICE)
                     mask, true_coord = mask.to(DEVICE), true_coord.to(DEVICE)
-
+                    # 仅在训练模式下，且为了稳妥，先只做翻转
+                    if model.training:
+                        iq, heatmap, true_coord, mask = apply_augmentation(iq, heatmap, true_coord, mask)
                     optimizer.zero_grad()
 
                     # 前向传播
