@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # 【新增】用于 Mish 激活函数
+
 
 # === 1. 通道注意力模块 (Channel Attention) ===
 class ChannelAttention(nn.Module):
@@ -66,29 +67,34 @@ class PhysicsGuidedNet(nn.Module):
         )  # Out: [B, 256]
 
         # --- B. Heatmap 分支 (Encoder) ---
-        # 512 -> 256
         self.enc1 = self._conv_block(1, 16)
-        # 256 -> 128
         self.enc2 = self._conv_block(16, 32)
-        # 128 -> 64
         self.enc3 = self._conv_block(32, 64)
-        # 64 -> 32
         self.enc4 = self._conv_block(64, 128)
-        # 32 -> 16
         self.enc5 = self._conv_block(128, 256)
-        # 16 -> 8 (Bottleneck)
         self.enc6 = self._conv_block(256, 512)
 
-        # 【新增】在瓶颈层加入注意力机制，让网络聚焦于“亮点”
+        # 瓶颈层注意力
         self.map_attention = CBAM(512)
 
-        # --- C. 融合与回归 (升级版) ---
-        # 使用 Mish 激活函数 (y = x * tanh(softplus(x)))，比 ReLU 更平滑，利于高精度回归
+        # --- C. 融合与回归 (修复与升级) ---
+
+        # 1. 定义 Mish 激活函数 (内部类)
         class Mish(nn.Module):
             def forward(self, x):
                 return x * torch.tanh(F.softplus(x))
 
-        # 加宽加深：768 -> 512 -> 256 -> 2
+        # 2. Map Reducer (之前报错丢失的部分!)
+        # 瓶颈层展平: 512 * 8 * 8 = 32768 -> 512
+        self.map_reducer = nn.Sequential(
+            nn.Linear(512 * 8 * 8, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(True),  # 这里可以用 ReLU 也可以换 Mish，ReLU 够用了
+            nn.Dropout(0.3)  # 同步增加 Dropout
+        )
+
+        # 3. Regressor (升级版: 更深 + Mish)
+        # IQ (256) + Map (512) = 768
         self.regressor = nn.Sequential(
             nn.Linear(768, 512),
             nn.BatchNorm1d(512),
@@ -101,10 +107,10 @@ class PhysicsGuidedNet(nn.Module):
             nn.Dropout(0.3),
 
             nn.Linear(256, 2),
-            nn.Sigmoid()  # 坐标归一化 (0-1)
+            nn.Sigmoid()
         )
 
-        # --- D. Decoder (保持不变，用于辅助训练) ---
+        # --- D. Decoder (辅助训练) ---
         self.dec1 = self._up_block(512, 256)
         self.dec2 = self._up_block(256, 128)
         self.dec3 = self._up_block(128, 64)
@@ -113,9 +119,8 @@ class PhysicsGuidedNet(nn.Module):
         self.dec6 = nn.Sequential(
             nn.ConvTranspose2d(16, 8, 4, 2, 1),
             nn.BatchNorm2d(8), nn.ReLU(True),
-            nn.Conv2d(8, 1, 3, 1, 1),
-            # 输出 Logits
-            # nn.Sigmoid()
+            nn.Conv2d(8, 1, 3, 1, 1)
+            # 输出 Logits (无 Sigmoid)，配合 BCEWithLogitsLoss
         )
 
     def _conv_block(self, in_c, out_c):
@@ -145,12 +150,12 @@ class PhysicsGuidedNet(nn.Module):
         x5 = self.enc5(x4)
         x6 = self.enc6(x5)  # [B, 512, 8, 8]
 
-        # 【应用 Attention】
+        # Attention
         x6 = self.map_attention(x6)
 
         # 展平并降维
         map_flat = x6.view(x6.size(0), -1)
-        map_feat = self.map_reducer(map_flat)  # [B, 512]
+        map_feat = self.map_reducer(map_flat)  # [B, 512] <-- 这里之前报错，现在应该好了
 
         # 3. 融合
         combined = torch.cat([iq_feat, map_feat], dim=1)  # [B, 768]
