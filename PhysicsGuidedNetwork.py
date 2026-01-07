@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 
 # === 1. 通道注意力模块 (Channel Attention) ===
 class ChannelAttention(nn.Module):
@@ -82,24 +82,26 @@ class PhysicsGuidedNet(nn.Module):
         # 【新增】在瓶颈层加入注意力机制，让网络聚焦于“亮点”
         self.map_attention = CBAM(512)
 
-        # --- C. 融合与回归 ---
-        # 瓶颈层展平: 512 * 8 * 8 = 32768
-        # 为了防止过拟合，我们先降维
-        self.map_reducer = nn.Sequential(
-            nn.Linear(512 * 8 * 8, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(True),
-            nn.Dropout(0.2)
-        )
+        # --- C. 融合与回归 (升级版) ---
+        # 使用 Mish 激活函数 (y = x * tanh(softplus(x)))，比 ReLU 更平滑，利于高精度回归
+        class Mish(nn.Module):
+            def forward(self, x):
+                return x * torch.tanh(F.softplus(x))
 
-        # IQ (256) + Map (512) = 768
+        # 加宽加深：768 -> 512 -> 256 -> 2
         self.regressor = nn.Sequential(
-            nn.Linear(768, 256),
+            nn.Linear(768, 512),
+            nn.BatchNorm1d(512),
+            Mish(),
+            nn.Dropout(0.3),
+
+            nn.Linear(512, 256),
             nn.BatchNorm1d(256),
-            nn.ReLU(True),
-            nn.Dropout(0.2),
+            Mish(),
+            nn.Dropout(0.3),
+
             nn.Linear(256, 2),
-            nn.Sigmoid()
+            nn.Sigmoid()  # 坐标归一化 (0-1)
         )
 
         # --- D. Decoder (保持不变，用于辅助训练) ---

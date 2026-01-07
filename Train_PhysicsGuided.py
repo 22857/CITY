@@ -164,7 +164,7 @@ def main():
     )
 
     # Loss 定义
-    criterion_coord = nn.MSELoss()
+    criterion_coord = nn.L1Loss()
     pos_weight = torch.tensor([20.0]).to(DEVICE)
     criterion_bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     criterion_dice = DiceLoss()
@@ -192,26 +192,64 @@ def main():
                 for iq, heatmap, true_coord, mask in train_loader:
                     iq, heatmap = iq.to(DEVICE), heatmap.to(DEVICE)
                     mask, true_coord = mask.to(DEVICE), true_coord.to(DEVICE)
-
-                    # ================= 应用修正后的增强 =================
-                    iq, heatmap, true_coord, mask = apply_augmentation(iq, heatmap, true_coord, mask)
-                    # =================================================
-
-                    optimizer.zero_grad()
-                    pred_coord, pred_mask = model(iq, heatmap)
-
                     true_coord_xy = true_coord[:, :2]
 
-                    # Loss 计算
-                    loss_c = criterion_coord(pred_coord, true_coord_xy)
-                    loss_b = criterion_bce(pred_mask, mask)
-                    loss_d = criterion_dice(pred_mask, mask)
+                    optimizer.zero_grad()
 
-                    loss_m = loss_b + loss_d
+                    # ================= 修改 2: 一致性训练策略 =================
+
+                    # --- Pass 1: 原始数据前向传播 ---
+                    pred_coord, pred_mask = model(iq, heatmap)
+
+                    # 基础 Loss
+                    loss_c = criterion_coord(pred_coord, true_coord_xy)
+                    loss_mask = criterion_bce(pred_mask, mask) + criterion_dice(pred_mask, mask)
+
+                    # --- Pass 2: 构建增强样本 (不计算梯度，只用于生成一致性目标? 不，这里要双向约束) ---
+                    # 强制在训练循环里做一次翻转
+                    iq_aug, map_aug, coord_aug, _ = apply_augmentation(iq.clone(), heatmap.clone(), true_coord.clone(),
+                                                                       mask.clone())
+
+                    # 对增强后的数据预测
+                    pred_coord_aug, _ = model(iq_aug, map_aug)
+
+                    # 计算一致性 Loss: || Pred_Aug - GT_Aug || (这其实就是数据增强的标准做法)
+                    # 但为了更强的一致性，我们可以加一个额外的约束：
+                    # Loss_Consistency = || Pred_Aug - Transform(Pred_Original) ||
+                    # 这里为了简化计算且节省显存，我们直接采用“混合数据增强”策略：
+                    # 即：并不显式计算 Consistency Loss，而是依赖 apply_augmentation
+                    # 配合 L1 Loss 的强大梯度来隐式达成。
+
+                    # 修正：既然我们要追求极致，直接把 augment 变成必选项，或者做两次 forward
+                    # 考虑到显存，我们采用 50% 概率做一致性正则化
+
+                    loss_consistency = 0.0
+                    if np.random.rand() > 0.5:
+                        # 构造翻转样本 (以水平翻转为例)
+                        # 翻转输入
+                        map_flip = torch.flip(heatmap, [3])
+                        # 交换 IQ (H-Flip: 0<->1, 2<->3...)
+                        idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=DEVICE)
+                        iq_flip = iq[:, idx_perm, :]
+
+                        # 预测翻转后的坐标
+                        pred_coord_flip, _ = model(iq_flip, map_flip)
+
+                        # 将翻转后的坐标还原: x' = 1 - x
+                        pred_coord_restored = pred_coord_flip.clone()
+                        pred_coord_restored[:, 0] = 1.0 - pred_coord_restored[:, 0]
+
+                        # 一致性 Loss: 原始预测 vs 还原后的翻转预测
+                        # 这强迫网络满足物理对称性
+                        loss_consistency = criterion_coord(pred_coord, pred_coord_restored.detach()) * 2.0
+                        # 注意：这里用了 detach()，通常作为正则项，或者双向都传梯度也可以
+
+                    # ========================================================
 
                     # 动态权重
-                    mask_weight = 0.5 if epoch < 20 else 0.1
-                    loss = loss_c + mask_weight * loss_m
+                    mask_w = 0.5 if epoch < 20 else 0.1
+                    # 总 Loss = 坐标(L1) + Mask + 一致性约束
+                    loss = loss_c + mask_w * loss_mask + 0.1 * loss_consistency
 
                     loss.backward()
                     optimizer.step()
