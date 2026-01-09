@@ -127,16 +127,37 @@ def main():
 
             optimizer.zero_grad()
 
-            # --- 开启混合精度训练 ---
+            # --- 1. 原始前向传播 ---
             with torch.cuda.amp.autocast():
                 pred_coord, pred_mask = model(iq, heatmap)
 
                 loss_c = criterion_coord(pred_coord, coord[:, :2])
                 loss_m = criterion_bce(pred_mask, mask) + criterion_dice(pred_mask, mask)
 
-                # 动态调整 Mask 权重
-                mask_w = 0.5 if epoch < 20 else 0.1
-                total_loss = loss_c + mask_w * loss_m
+            # --- 2. 一致性约束 (The Missing Piece) ---
+            # 50% 概率执行：让网络自己对比“翻转前”和“翻转后”的结果是否一致
+            loss_consistency = 0.0
+            if np.random.rand() > 0.5:
+                # 构造翻转输入
+                heatmap_flip = torch.flip(heatmap, [3])  # 水平翻转
+                # IQ 通道交换 (H-Flip)
+                idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=DEVICE)
+                iq_flip = iq[:, idx_perm, :]
+
+                with torch.cuda.amp.autocast():
+                    # 预测翻转后的数据
+                    pred_coord_flip, _ = model(iq_flip, heatmap_flip)
+
+                # 将坐标还原: x' = 1 - x
+                pred_coord_restored = pred_coord_flip.clone()
+                pred_coord_restored[:, 0] = 1.0 - pred_coord_restored[:, 0]
+
+                # 强迫“原始预测”和“还原后的翻转预测”一致
+                loss_consistency = criterion_coord(pred_coord, pred_coord_restored.detach())
+
+            # --- 总 Loss ---
+            mask_w = 0.5 if epoch < 20 else 0.1
+            total_loss = loss_c + mask_w * loss_m + 0.5 * loss_consistency  # 加上这一项
 
             # 反向传播缩放
             scaler.scale(total_loss).backward()
