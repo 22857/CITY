@@ -1,79 +1,55 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-import h5py
-import numpy as np
 import os
+import numpy as np
+
+# 导入你定义的模块
 from PhysicsGuidedNetwork import PhysicsGuidedNet
+from PhysicsGuidedDataset import PhysicsGuidedHDF5Dataset
 
-# ================= 路径配置 =================
-H5_PATH = r"D:\Dataset\SignalDataset\merged_dataset_512_3d_fast.h5"
+# ================= 1. 路径与硬件配置 =================
+H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_fast_v2.h5"  # 确保路径与生成脚本一致
+SAVE_PATH = "best_model_symmetric.pth"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ================= 超参数配置 =================
-BATCH_SIZE = 32
-CHUNK_SIZE = 2000
+# ================= 2. 超参数配置 =================
+BATCH_SIZE = 64  # 优化 H5 后可尝试增大至 64 或 128
+NUM_WORKERS = 8  # AutoDL 建议设为 8-16
 LR = 1e-4
 EPOCHS = 50
 SCENE_SIZE = 5000.0
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-# ================= 1. 物理修正版数据增强 (Core Fix) =================
+# ================= 3. 物理一致性增强函数 (保持) =================
 def apply_augmentation(iq, heatmap, coord, mask):
     """
-    对 Batch 数据进行随机旋转和翻转 (GPU加速)
-    必须同步交换 IQ 通道，以保持物理一致性！
-
-    接收机布局假设 (基于 MakeCsvIQData):
-    Rx0:(0,0), Rx1:(5000,0), Rx2:(5000,5000), Rx3:(0,5000)
-
-    IQ 数据结构 (基于 Generate_Multimodal_Data):
-    [B, 8, L] -> [Rx0_R, Rx1_R, Rx2_R, Rx3_R, Rx0_I, Rx1_I, Rx2_I, Rx3_I]
+    在 GPU 上进行数据增强，保持 IQ 通道与几何翻转的一致性
     """
-
-    # --- 1. 随机水平翻转 (H-Flip) ---
-    # 几何意义：左右互换 -> Rx0<->Rx1, Rx3<->Rx2
+    # 随机水平翻转
     if np.random.rand() > 0.5:
-        # A. 图片与标签翻转
-        heatmap = torch.flip(heatmap, [3])  # Width is dim 3
+        heatmap = torch.flip(heatmap, [3])
         mask = torch.flip(mask, [3])
-        coord[:, 0] = 1.0 - coord[:, 0]  # x = 1-x
-
-        # B. IQ 通道交换 (关键修正!)
-        # 实部交换: 0<->1, 3<->2
-        # 虚部交换: 4<->5, 7<->6
-        # 原始索引: [0, 1, 2, 3, 4, 5, 6, 7]
-        # 目标索引: [1, 0, 3, 2, 5, 4, 7, 6]
+        coord[:, 0] = 1.0 - coord[:, 0]
+        # H-Flip 索引交换: Rx0<->Rx1, Rx3<->Rx2
         idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=iq.device)
         iq = iq[:, idx_perm, :]
 
-    # --- 2. 随机垂直翻转 (V-Flip) ---
-    # 几何意义：上下互换 -> Rx0<->Rx3, Rx1<->Rx2
+    # 随机垂直翻转
     if np.random.rand() > 0.5:
-        # A. 图片与标签翻转
-        heatmap = torch.flip(heatmap, [2])  # Height is dim 2
+        heatmap = torch.flip(heatmap, [2])
         mask = torch.flip(mask, [2])
-        coord[:, 1] = 1.0 - coord[:, 1]  # y = 1-y
-
-        # B. IQ 通道交换 (关键修正!)
-        # 实部交换: 0<->3, 1<->2
-        # 虚部交换: 4<->7, 5<->6
-        # 原始索引: [0, 1, 2, 3, 4, 5, 6, 7]
-        # 目标索引: [3, 2, 1, 0, 7, 6, 5, 4]
+        coord[:, 1] = 1.0 - coord[:, 1]
+        # V-Flip 索引交换: Rx0<->Rx3, Rx1<->Rx2
         idx_perm = torch.tensor([3, 2, 1, 0, 7, 6, 5, 4], device=iq.device)
         iq = iq[:, idx_perm, :]
-
-    # (可选) 旋转 90度 也可以加了，因为 Rx 是正方形对称的
-    # 逆时针90度: (x,y)->(-y,x)。Rx0->Rx1->Rx2->Rx3->Rx0
-    # 对应 IQ 通道循环移位即可。为了稳妥，先只用 Flip 试试效果。
 
     return iq, heatmap, coord, mask
 
 
-# ================= 2. Dice Loss (保持) =================
+# ================= 4. Loss 定义 =================
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
         super(DiceLoss, self).__init__()
@@ -81,209 +57,105 @@ class DiceLoss(nn.Module):
 
     def forward(self, pred_logits, target):
         pred_probs = torch.sigmoid(pred_logits)
-        pred_flat = pred_probs.view(-1)
-        target_flat = target.view(-1)
-        intersection = (pred_flat * target_flat).sum()
-        dice = (2. * intersection + self.smooth) / (pred_flat.sum() + target_flat.sum() + self.smooth)
+        intersection = (pred_probs * target).sum()
+        dice = (2. * intersection + self.smooth) / (pred_probs.sum() + target.sum() + self.smooth)
         return 1 - dice
 
 
-# ================= 验证函数 =================
-def validate(model, val_indices, h5_file, criterion_coord, criterion_bce, criterion_dice, chunk_size=1000,
-             batch_size=32):
+# ================= 5. 验证函数 (优化版) =================
+def validate(model, loader, criterion_coord, criterion_bce, criterion_dice):
     model.eval()
-    total_loss = 0.0
     total_dist_err = 0.0
     num_samples = 0
 
     with torch.no_grad():
-        for i in range(0, len(val_indices), chunk_size):
-            current_indices = val_indices[i: i + chunk_size]
-            current_indices = np.sort(current_indices)
+        for iq, heatmap, coord, mask in loader:
+            iq, heatmap, coord, mask = iq.to(DEVICE), heatmap.to(DEVICE), coord.to(DEVICE), mask.to(DEVICE)
 
-            iq_ram = torch.from_numpy(h5_file['iq'][current_indices]).float()
-            heatmap_ram = torch.from_numpy(h5_file['heatmap'][current_indices]).float()
-            mask_ram = torch.from_numpy(h5_file['mask'][current_indices]).float()
-            coord_ram = torch.from_numpy(h5_file['coord'][current_indices]).float()
+            # 混合精度推理
+            with torch.cuda.amp.autocast():
+                pred_coord, _ = model(iq, heatmap)
 
-            temp_dataset = TensorDataset(iq_ram, heatmap_ram, coord_ram, mask_ram)
-            temp_loader = DataLoader(temp_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+            dist_err = torch.norm(pred_coord - coord[:, :2], dim=1) * SCENE_SIZE
+            total_dist_err += dist_err.sum().item()
+            num_samples += iq.size(0)
 
-            for iq, heatmap, true_coord, mask in temp_loader:
-                iq, heatmap = iq.to(DEVICE), heatmap.to(DEVICE)
-                mask, true_coord = mask.to(DEVICE), true_coord.to(DEVICE)
-
-                pred_coord, pred_mask = model(iq, heatmap)
-
-                true_coord_xy = true_coord[:, :2]
-                loss_c = criterion_coord(pred_coord, true_coord_xy)
-
-                loss_b = criterion_bce(pred_mask, mask)
-                loss_d = criterion_dice(pred_mask, mask)
-                loss_total = loss_c + 0.5 * (loss_b + loss_d)
-
-                batch_len = iq.size(0)
-                total_loss += loss_total.item() * batch_len
-
-                dist_meter = torch.norm(pred_coord - true_coord_xy, dim=1) * SCENE_SIZE
-                total_dist_err += dist_meter.sum().item()
-
-                num_samples += batch_len
-
-            del iq_ram, heatmap_ram, mask_ram, coord_ram, temp_dataset, temp_loader
-
-    return total_loss / num_samples, total_dist_err / num_samples
+    return total_dist_err / num_samples
 
 
-# ================= 主程序 =================
+# ================= 6. 主训练程序 =================
 def main():
-    print(f"🚀 启动物理修正增强版训练 (Symmetric Rx Augmentation) | Device: {DEVICE}")
+    print(f"🚀 启动极速版训练 | 设备: {DEVICE} | Workers: {NUM_WORKERS}")
 
-    if not os.path.exists(H5_PATH):
-        print(f"【错误】找不到数据集文件: {H5_PATH}")
-        return
+    # 1. 加载数据集
+    full_dataset = PhysicsGuidedHDF5Dataset(H5_PATH)
+    train_size = int(0.9 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
 
-    f = h5py.File(H5_PATH, 'r')
-    total_samples = len(f['iq'])
+    # 2. 创建 DataLoader (开启预取加速)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=4, pin_memory=True)
 
-    # 划分数据集
-    all_indices = np.arange(total_samples)
-    split_idx = int(0.9 * total_samples)
-    train_indices_all = all_indices[:split_idx]
-    val_indices_all = all_indices[split_idx:]
-
-    # 初始化模型
-    sample_iq = f['iq'][0]
-    num_rx = sample_iq.shape[0] // 2
-    model = PhysicsGuidedNet(num_rx=num_rx, signal_len=2048).to(DEVICE)
-
-    # 优化器 & 调度器
+    # 3. 初始化模型与优化器
+    model = PhysicsGuidedNet(num_rx=4, signal_len=2048).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-3)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, min_lr=1e-6
-    )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3)
 
-    # Loss 定义
+    # 混合精度缩放器
+    scaler = torch.cuda.amp.GradScaler()
+
+    # 4. Loss 定义
     criterion_coord = nn.L1Loss()
-    pos_weight = torch.tensor([20.0]).to(DEVICE)
-    criterion_bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    criterion_bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([20.0]).to(DEVICE))
     criterion_dice = DiceLoss()
 
     best_err = float('inf')
 
-    try:
-        for epoch in range(EPOCHS):
-            model.train()
-            train_loss_epoch = 0.0
-            pbar = tqdm(total=len(train_indices_all), desc=f"Epoch {epoch + 1}/{EPOCHS}")
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
 
-            for chunk_start in range(0, len(train_indices_all), CHUNK_SIZE):
-                chunk_end = min(chunk_start + CHUNK_SIZE, len(train_indices_all))
+        for iq, heatmap, coord, mask in pbar:
+            iq, heatmap, coord, mask = iq.to(DEVICE), heatmap.to(DEVICE), coord.to(DEVICE), mask.to(DEVICE)
 
-                # Load to RAM
-                iq_ram = torch.from_numpy(f['iq'][chunk_start:chunk_end])
-                map_ram = torch.from_numpy(f['heatmap'][chunk_start:chunk_end])
-                mask_ram = torch.from_numpy(f['mask'][chunk_start:chunk_end])
-                coord_ram = torch.from_numpy(f['coord'][chunk_start:chunk_end])
+            # 应用数据增强
+            iq, heatmap, coord, mask = apply_augmentation(iq, heatmap, coord, mask)
 
-                mem_dataset = TensorDataset(iq_ram, map_ram, coord_ram, mask_ram)
-                train_loader = DataLoader(mem_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+            optimizer.zero_grad()
 
-                for iq, heatmap, true_coord, mask in train_loader:
-                    iq, heatmap = iq.to(DEVICE), heatmap.to(DEVICE)
-                    mask, true_coord = mask.to(DEVICE), true_coord.to(DEVICE)
-                    true_coord_xy = true_coord[:, :2]
+            # --- 开启混合精度训练 ---
+            with torch.cuda.amp.autocast():
+                pred_coord, pred_mask = model(iq, heatmap)
 
-                    optimizer.zero_grad()
+                loss_c = criterion_coord(pred_coord, coord[:, :2])
+                loss_m = criterion_bce(pred_mask, mask) + criterion_dice(pred_mask, mask)
 
-                    # ================= 修改 2: 一致性训练策略 =================
+                # 动态调整 Mask 权重
+                mask_w = 0.5 if epoch < 20 else 0.1
+                total_loss = loss_c + mask_w * loss_m
 
-                    # --- Pass 1: 原始数据前向传播 ---
-                    pred_coord, pred_mask = model(iq, heatmap)
+            # 反向传播缩放
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
-                    # 基础 Loss
-                    loss_c = criterion_coord(pred_coord, true_coord_xy)
-                    loss_mask = criterion_bce(pred_mask, mask) + criterion_dice(pred_mask, mask)
+            train_loss += total_loss.item()
+            pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
 
-                    # --- Pass 2: 构建增强样本 (不计算梯度，只用于生成一致性目标? 不，这里要双向约束) ---
-                    # 强制在训练循环里做一次翻转
-                    iq_aug, map_aug, coord_aug, _ = apply_augmentation(iq.clone(), heatmap.clone(), true_coord.clone(),
-                                                                       mask.clone())
+        # 验证
+        val_err = validate(model, val_loader, criterion_coord, criterion_bce, criterion_dice)
+        print(f"Epoch {epoch + 1} 验证完成: 平均误差 = {val_err:.2f}m")
 
-                    # 对增强后的数据预测
-                    pred_coord_aug, _ = model(iq_aug, map_aug)
+        scheduler.step(val_err)
 
-                    # 计算一致性 Loss: || Pred_Aug - GT_Aug || (这其实就是数据增强的标准做法)
-                    # 但为了更强的一致性，我们可以加一个额外的约束：
-                    # Loss_Consistency = || Pred_Aug - Transform(Pred_Original) ||
-                    # 这里为了简化计算且节省显存，我们直接采用“混合数据增强”策略：
-                    # 即：并不显式计算 Consistency Loss，而是依赖 apply_augmentation
-                    # 配合 L1 Loss 的强大梯度来隐式达成。
-
-                    # 修正：既然我们要追求极致，直接把 augment 变成必选项，或者做两次 forward
-                    # 考虑到显存，我们采用 50% 概率做一致性正则化
-
-                    loss_consistency = 0.0
-                    if np.random.rand() > 0.5:
-                        # 构造翻转样本 (以水平翻转为例)
-                        # 翻转输入
-                        map_flip = torch.flip(heatmap, [3])
-                        # 交换 IQ (H-Flip: 0<->1, 2<->3...)
-                        idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=DEVICE)
-                        iq_flip = iq[:, idx_perm, :]
-
-                        # 预测翻转后的坐标
-                        pred_coord_flip, _ = model(iq_flip, map_flip)
-
-                        # 将翻转后的坐标还原: x' = 1 - x
-                        pred_coord_restored = pred_coord_flip.clone()
-                        pred_coord_restored[:, 0] = 1.0 - pred_coord_restored[:, 0]
-
-                        # 一致性 Loss: 原始预测 vs 还原后的翻转预测
-                        # 这强迫网络满足物理对称性
-                        loss_consistency = criterion_coord(pred_coord, pred_coord_restored.detach()) * 2.0
-                        # 注意：这里用了 detach()，通常作为正则项，或者双向都传梯度也可以
-
-                    # ========================================================
-
-                    # 动态权重
-                    mask_w = 0.5 if epoch < 20 else 0.1
-                    # 总 Loss = 坐标(L1) + Mask + 一致性约束
-                    loss = loss_c + mask_w * loss_mask + 0.1 * loss_consistency
-
-                    loss.backward()
-                    optimizer.step()
-
-                    train_loss_epoch += loss.item() * iq.size(0)
-
-                pbar.update(chunk_end - chunk_start)
-                pbar.set_postfix({'Loss': f"{loss.item():.4f}"})
-                del iq_ram, map_ram, mask_ram, coord_ram, mem_dataset, train_loader
-
-            pbar.close()
-
-            print("正在验证...")
-            avg_val_loss, avg_dist_err = validate(
-                model, val_indices_all, f,
-                criterion_coord, criterion_bce, criterion_dice,
-                chunk_size=CHUNK_SIZE, batch_size=BATCH_SIZE
-            )
-
-            avg_train_loss = train_loss_epoch / len(train_indices_all)
-            print(
-                f"Epoch {epoch + 1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}, Err={avg_dist_err:.2f}m")
-
-            scheduler.step(avg_dist_err)
-
-            if avg_dist_err < best_err:
-                best_err = avg_dist_err
-                torch.save(model.state_dict(), "best_model_symmetric.pth")
-                print(f">>> 新最优模型 (Symmetric): {best_err:.2f}m")
-
-    except KeyboardInterrupt:
-        print("\n训练中断。")
-    finally:
-        f.close()
+        if val_err < best_err:
+            best_err = val_err
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"🌟 发现更优模型: {best_err:.2f}m")
 
 
 if __name__ == '__main__':
