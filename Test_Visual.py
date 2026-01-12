@@ -8,7 +8,7 @@ import h5py
 from PhysicsGuidedNetwork import PhysicsGuidedNet
 
 # ================= 配置 =================
-H5_PATH = r"D:\Dataset\SignalDataset\merged_dataset_512_3d_fast.h5"
+H5_PATH = r"/root/autodl-tmp/merged_dataset_512_3d_fast_v2.h5"
 # 使用最新的对称增强模型
 MODEL_PATH = "best_model_symmetric.pth"
 SCENE_SIZE = 5000.0
