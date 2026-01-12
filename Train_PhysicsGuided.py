@@ -135,29 +135,31 @@ def main():
                 loss_m = criterion_bce(pred_mask, mask) + criterion_dice(pred_mask, mask)
 
             # --- 2. 一致性约束 (The Missing Piece) ---
-            # 50% 概率执行：让网络自己对比“翻转前”和“翻转后”的结果是否一致
-            loss_consistency = 0.0
+            loss_consistency = torch.tensor(0.0, device=DEVICE)
+
+            # 为了不显著增加显存，我们以 50% 概率触发，或者只对“预测不准”的样本触发
             if np.random.rand() > 0.5:
-                # 构造翻转输入
-                heatmap_flip = torch.flip(heatmap, [3])  # 水平翻转
-                # IQ 通道交换 (H-Flip)
+                # A. 构造翻转输入 (以水平翻转为例)
+                heatmap_flip = torch.flip(heatmap, [3])
+                # IQ 通道交换 (H-Flip: 0<->1, 2<->3...)
                 idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=DEVICE)
                 iq_flip = iq[:, idx_perm, :]
 
                 with torch.cuda.amp.autocast():
-                    # 预测翻转后的数据
+                    # B. 预测翻转后的数据 (这里只用 coord，不需要 mask)
                     pred_coord_flip, _ = model(iq_flip, heatmap_flip)
 
-                # 将坐标还原: x' = 1 - x
+                # C. 将预测出的坐标“翻转回来”: x' = 1 - x
                 pred_coord_restored = pred_coord_flip.clone()
                 pred_coord_restored[:, 0] = 1.0 - pred_coord_restored[:, 0]
 
-                # 强迫“原始预测”和“还原后的翻转预测”一致
-                loss_consistency = criterion_coord(pred_coord, pred_coord_restored.detach())
+                # D. 计算一致性: 强迫 (原始预测) ≈ (还原后的翻转预测)
+                # 这会极大地惩罚那些“乱猜”的样本，因为乱猜的结果翻转后通常对不上
+                loss_consistency = torch.nn.functional.l1_loss(pred_coord, pred_coord_restored.detach())
 
             # --- 总 Loss ---
-            mask_w = 0.5 if epoch < 20 else 0.1
-            total_loss = loss_c + mask_w * loss_m + 0.5 * loss_consistency  # 加上这一项
+            mask_w = 0.5 if epoch < 30 else 0.3
+            total_loss = loss_c + mask_w * loss_m + 2.0 * loss_consistency
 
             # 反向传播缩放
             scaler.scale(total_loss).backward()
