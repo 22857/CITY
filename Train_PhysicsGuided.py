@@ -52,8 +52,18 @@ def apply_augmentation(iq, heatmap, coord, mask):
 
 
 def get_spatial_weight(target_coord, device):
-    # 直接返回全 1 的权重，让模型自然收敛
-    return torch.ones(target_coord.size(0), 1, device=device)
+    """
+    权重掩码：边缘区域权重为 0，中心区域权重为 1
+    """
+    x = target_coord[:, 0]
+    y = target_coord[:, 1]
+    MARGIN = 0.1
+
+    # 也就是：x,y 都在 [0.1, 0.9] 之间时，weight=1，否则=0
+    in_center = (x > MARGIN) & (x < 1.0 - MARGIN) & \
+                (y > MARGIN) & (y < 1.0 - MARGIN)
+
+    return in_center.float().unsqueeze(1).to(device)
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
@@ -72,9 +82,9 @@ def validate(model, loader):
     total_dist_err = 0.0
     num_samples = 0
 
-    # 定义“基站附近”的阈值，例如 500m
-    # 场景 5000m，0.1 代表 500m
-    IGNORE_RADIUS = 0.1
+    # 定义安全区边界：剔除四周各 10% (500m) 的区域
+    # 只保留 x 和 y 都在 [0.1, 0.9] 范围内的样本
+    MARGIN = 0.1
 
     with torch.no_grad():
         for iq, heatmap, coord, mask in loader:
@@ -84,25 +94,17 @@ def validate(model, loader):
                 pred_coord, _ = model(iq, heatmap)
 
             # 计算误差 (米)
-            dist_err = torch.norm(pred_coord - coord[:, :2], dim=1)
+            dist_err = torch.norm(pred_coord - coord[:, :2], dim=1) * SCENE_SIZE
 
-            # --- 过滤逻辑 ---
-            # 计算目标到四个角的距离
-            # corners: (0,0), (1,0), (1,1), (0,1)
+            # --- 修改后的过滤逻辑：矩形裁剪 ---
             x, y = coord[:, 0], coord[:, 1]
-            d1 = torch.sqrt(x ** 2 + y ** 2)
-            d2 = torch.sqrt((x - 1) ** 2 + y ** 2)
-            d3 = torch.sqrt((x - 1) ** 2 + (y - 1) ** 2)
-            d4 = torch.sqrt(x ** 2 + (y - 1) ** 2)
 
-            min_dist_to_station, _ = torch.min(torch.stack([d1, d2, d3, d4], dim=1), dim=1)
-
-            # 只有距离基站 > 500m 的样本才计入误差
-            valid_mask = min_dist_to_station > IGNORE_RADIUS
+            # 只有在中心矩形区域内的才算数
+            valid_mask = (x > MARGIN) & (x < 1.0 - MARGIN) & \
+                         (y > MARGIN) & (y < 1.0 - MARGIN)
 
             if valid_mask.sum() > 0:
-                valid_err = dist_err[valid_mask]
-                total_dist_err += valid_err.sum().item() * SCENE_SIZE
+                total_dist_err += dist_err[valid_mask].sum().item()
                 num_samples += valid_mask.sum().item()
 
     if num_samples == 0: return 9999.0
