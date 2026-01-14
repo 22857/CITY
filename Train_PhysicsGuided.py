@@ -52,39 +52,8 @@ def apply_augmentation(iq, heatmap, coord, mask):
 
 
 def get_spatial_weight(target_coord, device):
-    """
-    根据目标位置计算 Loss 权重。
-    目标越靠近基站（四个角落），权重越大，用于解决边缘误差大的问题。
-    target_coord: [B, 3], 归一化坐标 (0~1)
-    """
-    x = target_coord[:, 0]
-    y = target_coord[:, 1]
-
-    # 四个基站的归一化坐标 (Rx0~Rx3 分布在四个角)
-    corners = torch.tensor([
-        [0.0, 0.0], [1.0, 0.0],
-        [1.0, 1.0], [0.0, 1.0]
-    ], device=device)
-
-    # 计算每个样本到最近基站的距离
-    dists = []
-    for cx, cy in corners:
-        d = torch.sqrt((x - cx) ** 2 + (y - cy) ** 2 + 1e-6)
-        dists.append(d)
-
-    dists = torch.stack(dists, dim=1)
-    min_dist, _ = torch.min(dists, dim=1)  # [B]
-
-    # --- 权重公式 ---
-    # 基础权重 1.0
-    # 额外权重：距离越近越大，最大 +4.0 (总权重 5.0)
-    # 衰减系数 0.15 控制影响范围
-    base_weight = 1.0
-    extra_weight = 4.0 * torch.exp(-min_dist / 0.15)
-
-    weight = base_weight + extra_weight
-    return weight.unsqueeze(1)  # [B, 1]
-
+    # 直接返回全 1 的权重，让模型自然收敛
+    return torch.ones(target_coord.size(0), 1, device=device)
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
@@ -103,6 +72,10 @@ def validate(model, loader):
     total_dist_err = 0.0
     num_samples = 0
 
+    # 定义“基站附近”的阈值，例如 500m
+    # 场景 5000m，0.1 代表 500m
+    IGNORE_RADIUS = 0.1
+
     with torch.no_grad():
         for iq, heatmap, coord, mask in loader:
             iq, heatmap, coord, mask = iq.to(DEVICE), heatmap.to(DEVICE), coord.to(DEVICE), mask.to(DEVICE)
@@ -110,10 +83,29 @@ def validate(model, loader):
             with torch.cuda.amp.autocast():
                 pred_coord, _ = model(iq, heatmap)
 
-            dist_err = torch.norm(pred_coord - coord[:, :2], dim=1) * SCENE_SIZE
-            total_dist_err += dist_err.sum().item()
-            num_samples += iq.size(0)
+            # 计算误差 (米)
+            dist_err = torch.norm(pred_coord - coord[:, :2], dim=1)
 
+            # --- 过滤逻辑 ---
+            # 计算目标到四个角的距离
+            # corners: (0,0), (1,0), (1,1), (0,1)
+            x, y = coord[:, 0], coord[:, 1]
+            d1 = torch.sqrt(x ** 2 + y ** 2)
+            d2 = torch.sqrt((x - 1) ** 2 + y ** 2)
+            d3 = torch.sqrt((x - 1) ** 2 + (y - 1) ** 2)
+            d4 = torch.sqrt(x ** 2 + (y - 1) ** 2)
+
+            min_dist_to_station, _ = torch.min(torch.stack([d1, d2, d3, d4], dim=1), dim=1)
+
+            # 只有距离基站 > 500m 的样本才计入误差
+            valid_mask = min_dist_to_station > IGNORE_RADIUS
+
+            if valid_mask.sum() > 0:
+                valid_err = dist_err[valid_mask]
+                total_dist_err += valid_err.sum().item() * SCENE_SIZE
+                num_samples += valid_mask.sum().item()
+
+    if num_samples == 0: return 9999.0
     return total_dist_err / num_samples
 
 
@@ -196,7 +188,7 @@ def main():
             # --- 总 Loss ---
             mask_w = 0.5 if epoch < 20 else 0.3
             # Consistency 权重给 2.0，强迫模型学会自洽
-            total_loss = loss_c + mask_w * loss_m + 2.0 * loss_consistency
+            total_loss = loss_c + mask_w * loss_m + 0 * loss_consistency
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
