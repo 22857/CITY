@@ -7,14 +7,14 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 # ================= 配置区域 (针对 AutoDL 优化) =================
-DATASET_ROOT = "/root/autodl-tmp/SNR[5, 5]/train"
-OUTPUT_H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_fast_v2.h5"
+DATASET_ROOT = "/root/autodl-tmp/SignalDataset_6Rx_SafeZone/SNR[5, 5]/train"
+OUTPUT_H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_train.h5"
 
 # 物理参数
 SCENE_SIZE = 5000.0
 MAP_SIZE = 512
 SIGNAL_LEN = 2048
-FS = 10e6
+FS = 50e6
 C = 299792458.0
 
 # --- 核心性能优化参数 ---
