@@ -5,16 +5,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
 import numpy as np
-
 # 导入网络和数据集
-# 请确保 PhysicsGuidedNetwork.py 已更新为适配 512 输入 (feat_dim = 512*8*8)
 from PhysicsGuidedNetwork import PhysicsGuidedNet
 from PhysicsGuidedDataset import PhysicsGuidedHDF5Dataset
 
 # ================= 配置区域 =================
 
 # 1. 数据集路径 (指向 MakeCsvIQData -> Generate_Multimodal_Data 生成的独立文件)
-# 请根据实际生成的文件名修改
 TRAIN_H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_train.h5"
 VAL_H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_valid.h5"
 
@@ -23,7 +20,6 @@ SAVE_PATH = "best_model_urban_512.pth"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 3. 核心训练参数
-# 【显存警告】512x512 热力图占用巨大显存
 # 24G 显存 (3090/4090) -> 32
 # 16G 显存 (V100/T4)   -> 16
 # 12G 显存 (1080Ti)    -> 8
@@ -163,42 +159,38 @@ def main():
 
                 # --- Loss Calculation ---
 
-                # A. 坐标回归 Loss (L1)
+                # A. 坐标回归 Loss (核心任务，权重加倍)
                 loss_c = criterion_coord(pred_coord, coord[:, :2])
 
-                # B. Mask 分割 Loss (BCE + Dice)
+                # B. Mask 分割 Loss (辅助任务，权重降低)
                 loss_bce = criterion_bce(pred_mask, mask)
                 loss_dice = criterion_dice(pred_mask, mask)
                 loss_m = loss_bce + loss_dice
 
-                # C. 一致性 Loss (Consistency / TTA)
+                # C. 一致性 Loss (王者归来：带 IQ 置换的 TTA)
+                # 只有加上这个 IQ 置换，TTA 才是对的！
                 loss_consistency = torch.tensor(0.0, device=DEVICE)
                 if True:
                     # 1. 翻转 Heatmap
                     heatmap_flip = torch.flip(heatmap, [3])
 
-                    # 2. 【核心修复】翻转 IQ 通道 (6Rx 六边形布局)
-                    # 必须加上这一步，否则 IQ 和 Heatmap 是反的！
-                    # indices: [Rx3, Rx2, Rx1, Rx0, Rx5, Rx4]
+                    # 2. 【关键】翻转 IQ 通道 (6Rx 正六边形)
+                    # 索引映射: Rx3, Rx2, Rx1, Rx0, Rx5, Rx4
                     idx_perm = torch.tensor([6, 7, 4, 5, 2, 3, 0, 1, 10, 11, 8, 9], device=DEVICE)
-                    iq_flip = iq[:, idx_perm, :]  # <--- 对 IQ 进行通道置换
+                    iq_flip = iq[:, idx_perm, :]
 
-                    # 3. 再次前向传播 (传入翻转后的 IQ)
-                    pred_coord_flip, _ = model(iq_flip, heatmap_flip)  # <--- 传入 iq_flip
+                    # 3. 传入翻转后的 iq_flip
+                    pred_coord_flip, _ = model(iq_flip, heatmap_flip)
 
                     # 4. 还原坐标
                     pred_restored = pred_coord_flip.clone()
                     pred_restored[:, 0] = 1.0 - pred_restored[:, 0]
 
-                    # 5. 计算 Loss
                     loss_consistency = torch.nn.functional.l1_loss(pred_coord, pred_restored.detach())
 
-                # D. 总 Loss 加权
-                # 权重策略:
-                # - 坐标 (1.0): 核心任务
-                # - Mask (0.1): 512分辨率下 Mask Loss 数值较大，需调低权重防止主导
-                # - 一致性 (10.0): 强约束，榨干网络精度
-                total_loss = loss_c + 0.1 * loss_m + 10.0 * loss_consistency
+                # D. 总 Loss (重新配比)
+                # 强坐标(10.0)，弱绘图(0.1)，强一致性(2.0)
+                total_loss = 10.0 * loss_c + 0.1 * loss_m + 2.0 * loss_consistency
 
             # Backward
             scaler.scale(total_loss).backward()

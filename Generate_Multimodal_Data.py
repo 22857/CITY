@@ -7,8 +7,8 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 # ================= 配置区域 (针对 AutoDL 优化) =================
-DATASET_ROOT = "/root/autodl-tmp/SignalDataset_6Rx_SafeZone/SNR[6, 6]/train"
-OUTPUT_H5_PATH = "/root/autodl-tmp/merged_dataset_snr6_train.h5"
+DATASET_ROOT = "/root/autodl-tmp/SignalDataset_6Rx_SafeZone/SNR[6, 6]/valid"
+OUTPUT_H5_PATH = "/root/autodl-tmp/merged_dataset_snr6_valid.h5"
 
 # 物理参数
 SCENE_SIZE = 5000.0

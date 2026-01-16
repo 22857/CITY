@@ -7,11 +7,22 @@ import matplotlib.pyplot as plt
 import h5py
 from PhysicsGuidedNetwork import PhysicsGuidedNet
 
-# ================= 配置 =================
+# 尝试导入骨架化算法
+try:
+    from skimage.morphology import skeletonize
+
+    HAS_SKIMAGE = True
+except ImportError:
+    HAS_SKIMAGE = False
+    print("【提示】未检测到 scikit-image 库，将只使用二值化显示 (建议 pip install scikit-image)")
+
+# ================= 配置区域 =================
+# 确保这里指向的是包含 6Rx 数据的验证集
 H5_PATH = r"/root/autodl-tmp/merged_dataset_512_3d_valid.h5"
 MODEL_PATH = "best_model_urban_512.pth"
+
 SCENE_SIZE = 5000.0
-MAP_SIZE = 512  # 【关键】必须与训练保持一致
+MAP_SIZE = 512  # 必须与训练时一致
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
@@ -25,13 +36,10 @@ def visualize():
     # 1. 获取数据
     with h5py.File(H5_PATH, 'r') as f:
         sample_iq = f['iq'][0]
-        # 自动推断接收机数量 (如果是12通道，num_rx=6)
         num_rx = sample_iq.shape[0] // 2
         print(f"检测到接收机数量: {num_rx} (通道数: {sample_iq.shape[0]})")
 
         total_num = len(f['iq'])
-
-        # 随机抽取 3 个样本
         indices = np.random.choice(total_num, 3, replace=False)
         indices = np.sort(indices)
         print(f"可视化样本索引: {indices}")
@@ -42,81 +50,86 @@ def visualize():
         true_coord = torch.from_numpy(f['coord'][indices]).float().to(DEVICE)
 
         # 2. 加载模型
-        # 【修正1】必须传入 map_size=512，否则 Linear 层会报错
         model = PhysicsGuidedNet(num_rx=num_rx, signal_len=2048, map_size=MAP_SIZE).to(DEVICE)
         model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
         model.eval()
 
-        # 3. TTA 推理 (关键部分)
+        # 3. TTA 推理
         with torch.no_grad():
-            # === Pass 1: 原始预测 ===
             pred_coord_1, pred_mask_1 = model(iq, heatmap)
 
-            # === Pass 2: 水平翻转预测 (H-Flip TTA) ===
-            # A. 翻转 Heatmap (Width=dim 3)
+            # TTA 翻转逻辑
             heatmap_flip = torch.flip(heatmap, [3])
-
-            # B. 交换 IQ 通道 (适配 6Rx 六边形布局)
-            # 布局假设: Rx0(右), Rx1(右上), Rx2(左上), Rx3(左), Rx4(左下), Rx5(右下)
-            # H-Flip 映射: 0<->3, 1<->2, 5<->4
-            # 通道结构: [R0_I, R0_Q, R1_I, R1_Q, ...]
-            # 目标顺序: [Rx3, Rx2, Rx1, Rx0, Rx5, Rx4]
-            # 对应通道: [6,7, 4,5, 2,3, 0,1, 10,11, 8,9]
-
             if num_rx == 6:
-                # 【修正2】这是正确的 12 通道置换索引
                 idx_perm = torch.tensor([6, 7, 4, 5, 2, 3, 0, 1, 10, 11, 8, 9], device=DEVICE)
                 iq_flip = iq[:, idx_perm, :]
             else:
-                # 兼容其他情况，不做 IQ 置换（仅翻转图）
-                print("警告: 非6站布局，跳过 IQ TTA 置换")
                 iq_flip = iq
 
-            # 预测
             pred_coord_flip, pred_mask_flip = model(iq_flip, heatmap_flip)
 
-            # === 还原结果 ===
-            # Mask 翻转回来
             pred_mask_2 = torch.flip(pred_mask_flip, [3])
-
-            # 坐标 x 还原: 1 - x
             pred_coord_2 = pred_coord_flip.clone()
             pred_coord_2[:, 0] = 1.0 - pred_coord_2[:, 0]
 
-            # === 平均 ===
             pred_mask_logits = (pred_mask_1 + pred_mask_2) / 2.0
             pred_coord = (pred_coord_1 + pred_coord_2) / 2.0
 
-    # 4. 数据转换与绘图
+    # 4. 后处理与绘图
     iq = iq.cpu().numpy()
     heatmap = heatmap.cpu().numpy()
     mask = mask.cpu().numpy()
-    pred_mask = torch.sigmoid(pred_mask_logits).cpu().numpy()
+    pred_prob = torch.sigmoid(pred_mask_logits).cpu().numpy()  # [B, 1, H, W]
+
     true_coord = true_coord.cpu().numpy()[:, :2] * SCENE_SIZE
     pred_coord = pred_coord.cpu().numpy() * SCENE_SIZE
 
     for i in range(3):
         dist_err = np.linalg.norm(true_coord[i] - pred_coord[i])
 
-        plt.figure(figsize=(15, 5))
+        # === 调试：打印概率值的统计信息 ===
+        p_min = pred_prob[i, 0].min()
+        p_max = pred_prob[i, 0].max()
+        p_mean = pred_prob[i, 0].mean()
+        print(f"样本 {indices[i]} | 预测概率范围: Min={p_min:.4f}, Max={p_max:.4f}, Mean={p_mean:.4f}")
 
-        # 子图1: Input Heatmap
+        plt.figure(figsize=(18, 6))
+
+        # 子图 1: Input
         plt.subplot(1, 3, 1)
         plt.title(f"Input Heatmap\nErr: {dist_err:.1f}m")
         plt.imshow(heatmap[i, 0], origin='lower', extent=[0, SCENE_SIZE, 0, SCENE_SIZE], cmap='jet')
-        plt.scatter(true_coord[i, 0], true_coord[i, 1], c='r', marker='x', s=120, linewidths=2, label='GT')
-        plt.scatter(pred_coord[i, 0], pred_coord[i, 1], c='white', marker='o', s=120, edgecolors='black', label='Pred')
-        plt.legend(loc='upper right')
+        plt.scatter(true_coord[i, 0], true_coord[i, 1], c='r', marker='x', s=150, linewidths=3, label='GT')
+        plt.scatter(pred_coord[i, 0], pred_coord[i, 1], c='w', marker='o', s=150, edgecolors='k', label='Pred')
 
-        # 子图2: GT Mask
+        # 子图 2: GT
         plt.subplot(1, 3, 2)
         plt.title("Ground Truth Mask")
         plt.imshow(mask[i, 0], origin='lower', extent=[0, SCENE_SIZE, 0, SCENE_SIZE], cmap='gray')
 
-        # 子图3: Pred Mask
+        # 子图 3: 智能处理后的预测
         plt.subplot(1, 3, 3)
-        plt.title(f"Predicted Mask (TTA)")
-        plt.imshow(pred_mask[i, 0], origin='lower', extent=[0, SCENE_SIZE, 0, SCENE_SIZE], cmap='gray')
+        plt.title(f"Processed Prediction\n(Max Prob: {p_max:.2f})")
+
+        # === 核心修改：自适应阈值 ===
+        # 如果最大概率太小 (<0.01)，说明模型没输出任何东西，显示黑图
+        if p_max < 0.01:
+            final_vis = np.zeros_like(pred_prob[i, 0])
+            print("  -> 警告：模型输出概率过低，显示全黑")
+        else:
+            # 动态阈值：取最大值的 40% 作为门槛
+            # 比如最大值是 0.2，阈值就是 0.08，这样能保证一定会显示出东西
+            dynamic_thresh = p_max * 0.4
+            binary_mask = pred_prob[i, 0] > dynamic_thresh
+
+            if HAS_SKIMAGE:
+                # 骨架化需要 bool 类型
+                final_vis = skeletonize(binary_mask)
+            else:
+                final_vis = binary_mask
+
+        plt.imshow(final_vis, origin='lower', extent=[0, SCENE_SIZE, 0, SCENE_SIZE], cmap='gray')
+        plt.scatter(true_coord[i, 0], true_coord[i, 1], c='r', marker='x', s=100)  # 叠加红叉方便对比
 
         plt.tight_layout()
         plt.show()
