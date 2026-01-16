@@ -52,7 +52,7 @@ class CBAM(nn.Module):
 
 # === 主网络 ===
 class PhysicsGuidedNet(nn.Module):
-    def __init__(self, num_rx=4, signal_len=2048, map_size=512):
+    def __init__(self, num_rx=6, signal_len=2048, map_size=512):
         super(PhysicsGuidedNet, self).__init__()
 
         # --- A. IQ 分支 ---

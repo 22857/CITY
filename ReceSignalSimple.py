@@ -2,7 +2,7 @@ import numpy as np
 import scipy.fft
 import DroneSignal
 
-def generate_urban_multipath_params(max_delay_spread=5e-6, num_taps=12):
+def generate_urban_multipath_params(max_delay_spread=1e-6, num_taps=4):
     """
     生成城市环境下的多径参数 (相对时延, 相对复数增益)
     基线修改：Dense Urban

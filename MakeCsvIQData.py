@@ -9,13 +9,12 @@ from tqdm import tqdm
 CONFIG = {
     'samplingRate': 50e6,
     'num_points': 4096,   # 信号长度
-    'SnrRange': [5, 5],   # 信噪比范围 (dB) - 稍微调高一点下限，保证数据质量
-    'dataNum': 100000,     # 总样本数量
+    'SnrRange': [6, 6],   # 信噪比范围 (dB) - 稍微调高一点下限，保证数据质量
+    'dataNum': 10000,     # 总样本数量
     'validRate': 0.1,      # 验证集比例
     
     # 接收机数量固定为 6
-    'receiverNumRange': [6, 6], 
-    
+    'receiverNumRange': [6, 6],
     'emitterNumRange': [1, 1],
     'receiverVelRange': [0, 0], # 接收机静止
     'emitterVelRange': [0, 10], # 发射机慢速移动

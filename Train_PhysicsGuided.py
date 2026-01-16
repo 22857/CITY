@@ -1,66 +1,64 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import os
 import numpy as np
 
-# 导入你定义的模块
+# 导入网络和数据集
+# 请确保 PhysicsGuidedNetwork.py 已更新为适配 512 输入 (feat_dim = 512*8*8)
 from PhysicsGuidedNetwork import PhysicsGuidedNet
 from PhysicsGuidedDataset import PhysicsGuidedHDF5Dataset
 
-# ================= 1. 路径与硬件配置 =================
-H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_fast_v2.h5"
-SAVE_PATH = "best_model_symmetric.pth"
+# ================= 配置区域 =================
+
+# 1. 数据集路径 (指向 MakeCsvIQData -> Generate_Multimodal_Data 生成的独立文件)
+# 请根据实际生成的文件名修改
+TRAIN_H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_train.h5"
+VAL_H5_PATH = "/root/autodl-tmp/merged_dataset_512_3d_valid.h5"
+
+# 2. 保存路径
+SAVE_PATH = "best_model_urban_512.pth"
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ================= 2. 超参数配置 =================
-BATCH_SIZE = 64
+# 3. 核心训练参数
+# 【显存警告】512x512 热力图占用巨大显存
+# 24G 显存 (3090/4090) -> 32
+# 16G 显存 (V100/T4)   -> 16
+# 12G 显存 (1080Ti)    -> 8
+BATCH_SIZE = 32
 NUM_WORKERS = 8
 LR = 1e-4
 EPOCHS = 50
 SCENE_SIZE = 5000.0
 
+# 【关键】明确指定分辨率和接收机数量，必须与数据生成一致
+MAP_SIZE = 512
+NUM_RX = 6
+SIGNAL_LEN = 2048
 
-# ================= 3. 工具函数 =================
+
+# ================= 工具模块 =================
 
 def apply_augmentation(iq, heatmap, coord, mask):
     """
-    在 GPU 上进行数据增强，保持 IQ 通道与几何翻转的一致性
+    数据增强：随机翻转 Heatmap 和 Mask，并同步调整坐标
+    注意：暂不翻转 IQ 通道，避免复杂的 6Rx 索引映射问题
     """
     # 随机水平翻转 (H-Flip)
     if np.random.rand() > 0.5:
         heatmap = torch.flip(heatmap, [3])
         mask = torch.flip(mask, [3])
         coord[:, 0] = 1.0 - coord[:, 0]
-        idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=iq.device)
-        iq = iq[:, idx_perm, :]
 
     # 随机垂直翻转 (V-Flip)
     if np.random.rand() > 0.5:
         heatmap = torch.flip(heatmap, [2])
         mask = torch.flip(mask, [2])
         coord[:, 1] = 1.0 - coord[:, 1]
-        idx_perm = torch.tensor([3, 2, 1, 0, 7, 6, 5, 4], device=iq.device)
-        iq = iq[:, idx_perm, :]
 
     return iq, heatmap, coord, mask
-
-
-def get_spatial_weight(target_coord, device):
-    """
-    权重掩码：边缘区域权重为 0，中心区域权重为 1
-    """
-    x = target_coord[:, 0]
-    y = target_coord[:, 1]
-    MARGIN = 0.1  # 剔除边缘 10%
-
-    # 也就是：x,y 都在 [0.1, 0.9] 之间时，weight=1，否则=0
-    in_center = (x > MARGIN) & (x < 1.0 - MARGIN) & \
-                (y > MARGIN) & (y < 1.0 - MARGIN)
-
-    return in_center.float().unsqueeze(1).to(device)
 
 
 class DiceLoss(nn.Module):
@@ -70,70 +68,83 @@ class DiceLoss(nn.Module):
 
     def forward(self, pred_logits, target):
         pred_probs = torch.sigmoid(pred_logits)
-        intersection = (pred_probs * target).sum()
-        dice = (2. * intersection + self.smooth) / (pred_probs.sum() + target.sum() + self.smooth)
-        return 1 - dice
+        # Flatten for Dice calculation
+        pred_flat = pred_probs.view(pred_probs.size(0), -1)
+        target_flat = target.view(target.size(0), -1)
+
+        intersection = (pred_flat * target_flat).sum(1)
+        dice = (2. * intersection + self.smooth) / (pred_flat.sum(1) + target_flat.sum(1) + self.smooth)
+        return 1 - dice.mean()
 
 
 def validate(model, loader):
+    """
+    验证函数：计算平均距离误差 (米)
+    已移除所有边缘过滤逻辑，全量评估
+    """
     model.eval()
     total_dist_err = 0.0
     num_samples = 0
 
-    # 矩形切割验证：只统计中心区域
-    MARGIN = 0.1
-
     with torch.no_grad():
         for iq, heatmap, coord, mask in loader:
-            iq, heatmap, coord, mask = iq.to(DEVICE), heatmap.to(DEVICE), coord.to(DEVICE), mask.to(DEVICE)
+            iq, heatmap, coord = iq.to(DEVICE), heatmap.to(DEVICE), coord.to(DEVICE)
 
             with torch.cuda.amp.autocast():
                 pred_coord, _ = model(iq, heatmap)
 
+            # 计算真实距离误差 (Euclidean Distance)
+            # coord[:, :2] 是归一化坐标 (0~1)，需乘 SCENE_SIZE 还原为米
             dist_err = torch.norm(pred_coord - coord[:, :2], dim=1) * SCENE_SIZE
 
-            # 过滤逻辑
-            x, y = coord[:, 0], coord[:, 1]
-            valid_mask = (x > MARGIN) & (x < 1.0 - MARGIN) & \
-                         (y > MARGIN) & (y < 1.0 - MARGIN)
-
-            if valid_mask.sum() > 0:
-                total_dist_err += dist_err[valid_mask].sum().item()
-                num_samples += valid_mask.sum().item()
+            total_dist_err += dist_err.sum().item()
+            num_samples += iq.size(0)
 
     if num_samples == 0: return 9999.0
     return total_dist_err / num_samples
 
 
-# ================= 4. 主训练程序 =================
+# ================= 主程序 =================
 def main():
-    print(f"🚀 启动终极版训练 (Safe Zone Only + Consistency) | 设备: {DEVICE}")
+    print(f"🚀 启动城市高精定位训练 | {MAP_SIZE}x{MAP_SIZE} | {NUM_RX}Rx | 设备: {DEVICE}")
+    print(f"📦 Batch Size: {BATCH_SIZE}")
 
-    # 1. 加载数据集
-    full_dataset = PhysicsGuidedHDF5Dataset(H5_PATH)
-    train_size = int(0.9 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+    # 1. 加载双数据集
+    print(f"Loading Train Set: {TRAIN_H5_PATH}")
+    if not os.path.exists(TRAIN_H5_PATH):
+        raise FileNotFoundError(f"找不到训练文件: {TRAIN_H5_PATH}")
+    train_ds = PhysicsGuidedHDF5Dataset(TRAIN_H5_PATH)
 
+    print(f"Loading Val Set:   {VAL_H5_PATH}")
+    if not os.path.exists(VAL_H5_PATH):
+        raise FileNotFoundError(f"找不到验证文件: {VAL_H5_PATH}")
+    val_ds = PhysicsGuidedHDF5Dataset(VAL_H5_PATH)
+
+    print(f"📊 训练样本: {len(train_ds)} | 验证样本: {len(val_ds)}")
+
+    # DataLoader
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
                             num_workers=4, pin_memory=True)
 
     # 2. 模型初始化
-    model = PhysicsGuidedNet(num_rx=4, signal_len=2048).to(DEVICE)
+    # 显式传入 map_size=512 以匹配 PhysicsGuidedNetwork 中的全连接层定义
+    model = PhysicsGuidedNet(num_rx=NUM_RX, signal_len=SIGNAL_LEN, map_size=MAP_SIZE).to(DEVICE)
+
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-3)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=3)
     scaler = torch.cuda.amp.GradScaler()
 
     # 3. Loss 定义
-    criterion_coord = nn.L1Loss(reduction='none')
-    # 【关键修改】保留 reduction='none'，以便下面手动处理标量化
-    criterion_bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([20.0]).to(DEVICE), reduction='none')
+    criterion_coord = nn.L1Loss()  # 默认 mean reduction
+    # 针对 512x512 的稀疏目标，给予正样本极高权重 (50.0)
+    criterion_bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([50.0]).to(DEVICE))
     criterion_dice = DiceLoss()
 
     best_err = float('inf')
 
+    # 4. 训练循环
     for epoch in range(EPOCHS):
         model.train()
         train_loss = 0.0
@@ -142,62 +153,54 @@ def main():
         for iq, heatmap, coord, mask in pbar:
             iq, heatmap, coord, mask = iq.to(DEVICE), heatmap.to(DEVICE), coord.to(DEVICE), mask.to(DEVICE)
 
-            # 1. 基础增强
+            # 数据增强
             iq, heatmap, coord, mask = apply_augmentation(iq, heatmap, coord, mask)
 
             optimizer.zero_grad()
-
             with torch.cuda.amp.autocast():
-                # --- Pass A: 原始前向传播 ---
+                # Forward
                 pred_coord, pred_mask = model(iq, heatmap)
 
-                # 1. 计算空间权重 (中心为1, 边缘为0)
-                spatial_w = get_spatial_weight(coord, DEVICE)  # [B, 1]
-                num_valid = spatial_w.sum() + 1e-6
+                # --- Loss Calculation ---
 
-                # A1. 坐标 Loss (只计算有效区域)
-                raw_loss_c = criterion_coord(pred_coord, coord[:, :2])  # [B, 2]
-                loss_c = (raw_loss_c * spatial_w).sum() / num_valid
+                # A. 坐标回归 Loss (L1)
+                loss_c = criterion_coord(pred_coord, coord[:, :2])
 
-                # A2. Mask Loss (手动处理张量 -> 标量)
-                # bce_map: [B, 1, 512, 512]
-                bce_map = criterion_bce(pred_mask, mask)
-
-                # 应用空间权重: 扩展维度以匹配 [B, 1, 1, 1]
-                # 只有中心的样本计算 Loss，边缘样本 Loss 归零
-                bce_masked = bce_map * spatial_w.view(-1, 1, 1, 1)
-
-                # 求和并归一化 (除以有效像素总数)
-                loss_bce = bce_masked.sum() / (num_valid * 512 * 512 + 1e-6)
-
-                # Dice Loss (这个一般是全局标量，暂时不加权，影响不大)
+                # B. Mask 分割 Loss (BCE + Dice)
+                loss_bce = criterion_bce(pred_mask, mask)
                 loss_dice = criterion_dice(pred_mask, mask)
-
                 loss_m = loss_bce + loss_dice
 
-            # --- Pass B: 一致性约束 (仅在安全区重启) ---
-            loss_consistency = torch.tensor(0.0, device=DEVICE)
+                # C. 一致性 Loss (Consistency / TTA)
+                loss_consistency = torch.tensor(0.0, device=DEVICE)
+                if True:
+                    # 1. 翻转 Heatmap
+                    heatmap_flip = torch.flip(heatmap, [3])
 
-            if True:
-                heatmap_flip = torch.flip(heatmap, [3])
-                idx_perm = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6], device=DEVICE)
-                iq_flip = iq[:, idx_perm, :]
+                    # 2. 【核心修复】翻转 IQ 通道 (6Rx 六边形布局)
+                    # 必须加上这一步，否则 IQ 和 Heatmap 是反的！
+                    # indices: [Rx3, Rx2, Rx1, Rx0, Rx5, Rx4]
+                    idx_perm = torch.tensor([6, 7, 4, 5, 2, 3, 0, 1, 10, 11, 8, 9], device=DEVICE)
+                    iq_flip = iq[:, idx_perm, :]  # <--- 对 IQ 进行通道置换
 
-                with torch.cuda.amp.autocast():
-                    pred_coord_flip, _ = model(iq_flip, heatmap_flip)
+                    # 3. 再次前向传播 (传入翻转后的 IQ)
+                    pred_coord_flip, _ = model(iq_flip, heatmap_flip)  # <--- 传入 iq_flip
 
-                pred_coord_restored = pred_coord_flip.clone()
-                pred_coord_restored[:, 0] = 1.0 - pred_coord_restored[:, 0]
+                    # 4. 还原坐标
+                    pred_restored = pred_coord_flip.clone()
+                    pred_restored[:, 0] = 1.0 - pred_restored[:, 0]
 
-                # 计算一致性并应用空间权重
-                raw_consis = torch.abs(pred_coord - pred_coord_restored.detach())  # [B, 2]
-                loss_consistency = (raw_consis * spatial_w).sum() / num_valid
+                    # 5. 计算 Loss
+                    loss_consistency = torch.nn.functional.l1_loss(pred_coord, pred_restored.detach())
 
-            # --- 总 Loss ---
-            # 重启 Consistency (权重 10.0)
-            mask_w = 0.2
-            total_loss = loss_c + mask_w * loss_m + 10.0 * loss_consistency
+                # D. 总 Loss 加权
+                # 权重策略:
+                # - 坐标 (1.0): 核心任务
+                # - Mask (0.1): 512分辨率下 Mask Loss 数值较大，需调低权重防止主导
+                # - 一致性 (10.0): 强约束，榨干网络精度
+                total_loss = loss_c + 0.1 * loss_m + 10.0 * loss_consistency
 
+            # Backward
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -205,18 +208,20 @@ def main():
             train_loss += total_loss.item()
             pbar.set_postfix({
                 'Loss': f"{total_loss.item():.3f}",
+                'L_c': f"{loss_c.item():.3f}",
                 'Consis': f"{loss_consistency.item():.3f}"
             })
 
+        # 验证阶段
         val_err = validate(model, val_loader)
-        print(f"Epoch {epoch + 1} 验证完成: 平均误差 = {val_err:.2f}m")
-
+        print(f"Epoch {epoch + 1} 验证误差: {val_err:.2f}m")
         scheduler.step(val_err)
 
+        # 保存最佳模型
         if val_err < best_err:
             best_err = val_err
             torch.save(model.state_dict(), SAVE_PATH)
-            print(f"🌟 发现更优模型: {best_err:.2f}m")
+            print(f"🌟 新纪录: {best_err:.2f}m (已保存)")
 
 
 if __name__ == '__main__':

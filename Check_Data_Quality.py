@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # 你的数据路径
-H5_PATH = r"D:\Dataset\SignalDataset\merged_dataset_512_3d_soft.h5"
+H5_PATH = r"/root/autodl-tmp/merged_dataset_512_3d_valid.h5"
 
 with h5py.File(H5_PATH, 'r') as f:
     # 随机选一个样本
